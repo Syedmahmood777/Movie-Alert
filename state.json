@@ -1,4 +1,6 @@
 {
-  "available": false,
-  "checked_at": 1794908684
+  "available": [
+    "PIMH"
+  ],
+  "checked_at": 1795418921
 }
