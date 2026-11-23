@@ -94,7 +94,9 @@ def load_config():
         required.append("requested_date")
     elif detector != "venue_date":
         required.append("theatre")
-    if detector == "venue_date" and not (cfg.get("venue_code") or cfg.get("venue_codes")):
+    if detector == "venue_date" and not (
+    cfg.get("venue_codes") or cfg.get("venue_code")
+):
         sys.exit("venue_date detector needs 'venue_code' or 'venue_codes'")
     missing = [k for k in required if not cfg.get(k)]
     if missing:
@@ -203,7 +205,13 @@ def is_available_venue_date(page_text, cfg):
     """
     date = cfg["requested_date"]
     codes = cfg.get("venue_codes") or [cfg["venue_code"]]
-    return any("/{}/{}".format(code, date) in page_text for code in codes)
+
+    available = [
+        code for code in codes
+        if f"/{code}/{date}" in page_text
+    ]
+
+    return available
 
 
 def is_available(page_text, cfg):
@@ -264,7 +272,11 @@ def main():
         print(f"[{label}] fetch failed: {exc}")
         return 0
 
-    available = is_available(page, cfg)
+    if cfg.get("detector") == "venue_date":
+        available = is_available_venue_date(page, cfg)
+    else:
+        available = is_available(page, cfg)
+        
     print(f"[{label}] available={available} (was {state.get('available')})")
 
     if available and not state.get("available"):
