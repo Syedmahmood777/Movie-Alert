@@ -5,13 +5,11 @@
   "venue_codes": [
     "PVUM",
     "PIMH",
-    "APNS"
   ],
 
   "venue_labels": {
     "VENUE_CODE_1": "PVR: Musarambagh, Hyderabad",
     "VENUE_CODE_2": "PVR: Irrum Manzil, Hyderabad",
-    "VENUE_CODE_3": "Aparna Cinemas: Shamshabad"
   },
   "url_template": "https://in.bookmyshow.com/movies/hyderabad/avengers-doomsday/buytickets/ET00526287/{date}",
   "min_references": 10
