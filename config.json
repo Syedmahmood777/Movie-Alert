@@ -6,7 +6,6 @@
   "venue_codes": ["PVUM"],
   "venue_labels": {
     "PVUM": "PVR: Musarambagh, Hyderabad"
-
   },
   "url_template": "https://in.bookmyshow.com/movies/hyderabad/avengers-doomsday/buytickets/ET00526287/{date}"
 }
