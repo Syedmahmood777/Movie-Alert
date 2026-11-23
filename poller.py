@@ -132,13 +132,23 @@ def fetch(cfg):
     headers = dict(DEFAULT_HEADERS)
     headers.update(cfg.get("headers", {}))
 
-    scraper_key = os.environ.get("SCRAPERAPI_KEY")
-    if scraper_key:
-        api_url = "https://api.scraperapi.com/?" + urllib.parse.urlencode(
-            {"api_key": scraper_key, "country_code": "in", "url": cfg["target_url"]}
+    scrape_do_token = os.environ.get("SCRAPE_DO_TOKEN")
+
+    if scrape_do_token:
+        resp = requests.get(
+            "https://api.scrape.do/",
+            params={
+                "token": scrape_do_token,
+                "url": cfg["target_url"],
+            },
+            timeout=90,
         )
-        resp = requests.get(api_url, timeout=90)
-        resp.raise_for_status()
+
+        if not resp.ok:
+            print(f"Scrape.do status: {resp.status_code}")
+            print(f"Scrape.do response: {resp.text[:1000]}")
+            resp.raise_for_status()
+
         return resp.text
 
     proxy = os.environ.get("PROXY_URL")
