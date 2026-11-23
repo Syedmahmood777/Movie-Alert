@@ -9,7 +9,6 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 import requests
-from dotenv import load_dotenv
 
 
 # ============================================================
@@ -19,8 +18,6 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", BASE_DIR / "config.json"))
 STATE_PATH = Path(os.getenv("STATE_PATH", BASE_DIR / "state.json"))
-
-load_dotenv(BASE_DIR / ".env")
 
 
 def expand_dates(cfg):
