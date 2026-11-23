@@ -36,6 +36,7 @@ jobs:
           # Route through an India egress so BookMyShow doesn't 403 the
           # US-based GitHub runner. Set SCRAPERAPI_KEY (or PROXY_URL) as a secret.
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          SCRAPE_DO_TOKEN: ${{ secrets.SCRAPE_DO_TOKEN }}
           PROXY_URL: ${{ secrets.PROXY_URL }}
         run: python poller.py
 
