@@ -1,16 +1,12 @@
 {
-  "detector": "venue_date",
   "movie": "Avengers: Doomsday",
-  "requested_date": "20261217",
-  "venue_codes": [
-    "PVUM",
-    "PIMH"
-  ],
-
+  "date_from": "20261219",
+  "date_to": "20261220",
+  "languages": ["English"],
+  "venue_codes": ["PVUM"],
   "venue_labels": {
-    "VENUE_CODE_1": "PVR: Musarambagh, Hyderabad",
-    "VENUE_CODE_2": "PVR: Irrum Manzil, Hyderabad"
+    "PVUM": "PVR: Musarambagh, Hyderabad"
+
   },
-  "url_template": "https://in.bookmyshow.com/movies/hyderabad/avengers-doomsday/buytickets/ET00526287/{date}",
-  "min_references": 10
+  "url_template": "https://in.bookmyshow.com/movies/hyderabad/avengers-doomsday/buytickets/ET00526287/{date}"
 }

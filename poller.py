@@ -1,325 +1,713 @@
 #!/usr/bin/env python3
-"""
-Ticket-booking watcher.
-
-Polls a URL (a BookMyShow / District showtimes page, or an internal API
-request you grabbed from your browser's DevTools) and sends a Telegram
-message the moment a given theatre appears with booking open.
-
-State is tracked in state.json so you get alerted on the *transition*
-to "available" instead of on every run.
-
-Everything is driven by config.json (and/or environment variables), so
-nothing site-specific is hardcoded -- if BookMyShow/District change their
-markup you only edit config, not code.
-"""
 
 import json
 import os
 import re
 import sys
-import time
-import urllib.parse
-from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
-
-ROOT = Path(__file__).resolve().parent
-CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", ROOT / "config.json"))
-STATE_PATH = Path(os.environ.get("STATE_PATH", ROOT / "state.json"))
-
-# Look like a real Chrome on Windows -- BMS rejects obvious bots.
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-IN,en-US;q=0.9,en;q=0.8",
-    "Upgrade-Insecure-Requests": "1",
-    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-Fetch-User": "?1",
-}
+from dotenv import load_dotenv
 
 
-def load_json(path, default=None):
-    if not path.exists():
-        return default
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+# ============================================================
+# Configuration
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.getenv("CONFIG_PATH", BASE_DIR / "config.json"))
+STATE_PATH = Path(os.getenv("STATE_PATH", BASE_DIR / "state.json"))
+
+load_dotenv(BASE_DIR / ".env")
 
 
-def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2)
+def expand_dates(cfg):
+    """
+    Build the list of dates (YYYYMMDD) to check. Supported, in priority order:
+
+      env REQUESTED_DATES = "20261219,20261220"  or  "20261219-20261220"
+      config "requested_dates": ["20261219", "20261220"]
+      config "date_from": "20261219", "date_to": "20261220"
+      config "requested_date": "20261219"   (single date)
+    """
+    env_value = os.getenv("REQUESTED_DATES") or os.getenv("REQUESTED_DATE")
+
+    if env_value:
+        env_value = env_value.strip()
+
+        if "-" in env_value:
+            start, end = [p.strip() for p in env_value.split("-", 1)]
+            return date_range(start, end)
+
+        return [d.strip() for d in env_value.split(",") if d.strip()]
+
+    if cfg.get("requested_dates"):
+        return list(cfg["requested_dates"])
+
+    if cfg.get("date_from") and cfg.get("date_to"):
+        return date_range(cfg["date_from"], cfg["date_to"])
+
+    if cfg.get("requested_date"):
+        return [cfg["requested_date"]]
+
+    raise ValueError(
+        "No dates configured. Set requested_dates, "
+        "date_from/date_to, or requested_date."
+    )
+
+
+def date_range(start, end):
+    """Inclusive list of YYYYMMDD strings from start to end."""
+    d1 = datetime.strptime(start, "%Y%m%d")
+    d2 = datetime.strptime(end, "%Y%m%d")
+
+    if d2 < d1:
+        raise ValueError(f"date range end {end} is before start {start}")
+
+    days = (d2 - d1).days
+
+    return [
+        (d1 + timedelta(days=i)).strftime("%Y%m%d")
+        for i in range(days + 1)
+    ]
+
+
+def pretty_date(date_code):
+    """'20261219' -> 'Sat, 19 Dec 2026'."""
+    try:
+        return datetime.strptime(date_code, "%Y%m%d").strftime("%a, %d %b %Y")
+    except ValueError:
+        return date_code
+
+
+def url_for_date(cfg, date_code):
+    """Movie page URL for a given date."""
+    if cfg.get("url_template"):
+        return cfg["url_template"].format(date=date_code)
+
+    base = os.getenv("TARGET_URL") or cfg["target_url"]
+
+    return re.sub(r"/\d{8}$", "/" + date_code, base)
 
 
 def load_config():
-    cfg = load_json(CONFIG_PATH, default={}) or {}
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
 
-    # Environment variables override the file (used by GitHub Actions secrets).
-    env_map = {
-        "TARGET_URL": "target_url",
-        "THEATRE": "theatre",
-        "MOVIE": "movie",
-        "REQUESTED_DATE": "requested_date",
-        "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
-        "TELEGRAM_CHAT_ID": "telegram_chat_id",
-    }
-    for env_key, cfg_key in env_map.items():
-        if os.environ.get(env_key):
-            cfg[cfg_key] = os.environ[env_key]
+    cfg["movie"] = os.getenv("MOVIE", cfg["movie"])
 
-    if os.environ.get("HEADERS_JSON"):
-        cfg["headers"] = json.loads(os.environ["HEADERS_JSON"])
+    cfg["dates"] = expand_dates(cfg)
 
-    # The BMS date is embedded in the URL, so build the URL from the template
-    # and the (possibly overridden) requested_date. Set REQUESTED_DATE=20260717
-    # to point everything at the 17th for a live end-to-end test.
-    if cfg.get("url_template") and cfg.get("requested_date"):
-        cfg["target_url"] = cfg["url_template"].format(date=cfg["requested_date"])
+    cfg["telegram_bot_token"] = os.getenv(
+        "TELEGRAM_BOT_TOKEN",
+        cfg.get("telegram_bot_token", "")
+    )
 
-    required = ["target_url", "telegram_bot_token", "telegram_chat_id"]
-    detector = cfg.get("detector")
-    if detector in ("bms_date", "venue_date"):
-        required.append("requested_date")
-    elif detector != "venue_date":
-        required.append("theatre")
-    if detector == "venue_date" and not (
-    cfg.get("venue_codes") or cfg.get("venue_code")
-):
-        sys.exit("venue_date detector needs 'venue_code' or 'venue_codes'")
-    missing = [k for k in required if not cfg.get(k)]
-    if missing:
-        sys.exit(f"Missing required config: {', '.join(missing)}")
+    cfg["telegram_chat_id"] = os.getenv(
+        "TELEGRAM_CHAT_ID",
+        cfg.get("telegram_chat_id", "")
+    )
+
+    # Only English formats by default.
+    cfg["languages"] = cfg.get("languages") or ["English"]
+
+    # Venues to match: by venue code, or by venue name (venue_labels).
+    cfg["venue_codes"] = cfg.get("venue_codes") or []
+    cfg["venue_labels"] = cfg.get("venue_labels") or {}
+
     return cfg
 
 
-def send_telegram(token, chat_id, text):
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    resp = requests.post(
-        url,
-        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": False},
-        timeout=30,
-    )
-    resp.raise_for_status()
+def cfg_for_date(cfg, date_code):
+    """Copy of cfg pointed at a single date."""
+    dated = dict(cfg)
+    dated["requested_date"] = date_code
+    dated["target_url"] = url_for_date(cfg, date_code)
+
+    return dated
 
 
-def fetch(cfg):
-    """
-    Fetch the target URL from an India egress when configured.
+# ============================================================
+# State (so we only alert on newly opened venues)
+# ============================================================
 
-    BookMyShow blocks non-India / datacenter IPs (e.g. GitHub's US runners),
-    so a plain request from CI gets a 403. Two ways to route through India:
+def load_state():
+    if STATE_PATH.exists():
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print("WARNING: state.json unreadable, starting fresh.")
 
-    * SCRAPERAPI_KEY  -- routes via ScraperAPI with country_code=in and solves
-                         anti-bot. Easiest for CI. Set it as a repo secret.
-    * PROXY_URL       -- a standard http(s) proxy string, e.g.
-                         "http://user:pass@in-proxy-host:port".
+    return {}
 
-    With neither set, it makes a direct request with browser headers plus a
-    cookie warm-up -- enough only when running from an India IP.
-    """
-    headers = dict(DEFAULT_HEADERS)
-    headers.update(cfg.get("headers", {}))
 
-    scrape_do_token = os.environ.get("SCRAPE_DO_TOKEN")
+def save_state(state):
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+
+
+def state_key(date_code, format_code, venue_code):
+    return f"{date_code}:{format_code}:{venue_code}"
+
+
+# ============================================================
+# Fetch BookMyShow page
+# ============================================================
+
+def fetch(cfg, url=None):
+    url = url or cfg["target_url"]
+
+    scrape_do_token = os.getenv("SCRAPE_DO_TOKEN")
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,"
+            "image/webp,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
     if scrape_do_token:
-        resp = requests.get(
+        print("Using Scrape.do (India)")
+
+        response = requests.get(
             "https://api.scrape.do/",
             params={
                 "token": scrape_do_token,
-                "url": cfg["target_url"],
+                "url": url,
+                "geoCode": "in"
             },
-            timeout=90,
+            headers=headers,
+            timeout=90
         )
 
-        if not resp.ok:
-            print(f"Scrape.do status: {resp.status_code}")
-            print(f"Scrape.do response: {resp.text[:1000]}")
-            resp.raise_for_status()
+    else:
+        print("Using direct request")
 
-        return resp.text
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=45
+        )
 
-    proxy = os.environ.get("PROXY_URL")
-    proxies = {"http": proxy, "https": proxy} if proxy else None
+    print(f"HTTP status: {response.status_code}")
 
-    session = requests.Session()
-    session.headers.update(headers)
+    response.raise_for_status()
 
-    # Warm-up: hit the homepage first to pick up cookies (helps soft bot checks).
+    return response
+
+
+# ============================================================
+# Extract BookMyShow initial state
+# ============================================================
+
+def extract_state(page):
+    html = page.text
+
+    marker = "window.__INITIAL_STATE__"
+
+    marker_position = html.find(marker)
+
+    if marker_position == -1:
+        raise ValueError(
+            "window.__INITIAL_STATE__ not found in page"
+        )
+
+    start = html.find("{", marker_position + len(marker))
+
+    if start == -1:
+        raise ValueError(
+            "Could not find JSON object in initial state"
+        )
+
+    decoder = json.JSONDecoder()
+
+    state, _ = decoder.raw_decode(html[start:])
+
+    return state
+
+
+# ============================================================
+# JSON helpers
+# ============================================================
+
+def walk(node):
+    """Yield every dict in a nested JSON structure."""
+    if isinstance(node, dict):
+        yield node
+
+        for value in node.values():
+            yield from walk(value)
+
+    elif isinstance(node, list):
+        for item in node:
+            yield from walk(item)
+
+
+# ============================================================
+# Find format selectors
+# ============================================================
+
+def find_format_selector(state):
+    selectors = []
+
+    for node in walk(state):
+        value = node.get("format-selector")
+
+        if isinstance(value, dict):
+            selectors.append(value)
+
+    return selectors
+
+
+# ============================================================
+# Construct format-specific URL
+# ============================================================
+
+def build_format_url(cfg, event_code, event_slug):
+    parts = urlsplit(cfg["target_url"])
+
+    segments = parts.path.split("/")
+
     try:
-        session.get("https://in.bookmyshow.com/", timeout=30, proxies=proxies)
-    except requests.RequestException:
-        pass
+        movies_index = segments.index("movies")
 
-    resp = session.get(
-        cfg["target_url"],
-        timeout=30,
-        proxies=proxies,
-        headers={"Referer": "https://in.bookmyshow.com/explore/movies-chennai"},
-    )
-    resp.raise_for_status()
-    return resp.text
+        if segments[movies_index + 3] != "buytickets":
+            raise ValueError(
+                "Unexpected BookMyShow URL structure"
+            )
 
+        # Replace movie slug, event code and date.
+        segments[movies_index + 2] = event_slug
+        segments[movies_index + 4] = event_code
+        segments[movies_index + 5] = cfg["requested_date"]
 
-def is_available_bms_date(page_text, cfg):
-    """
-    BookMyShow-specific detector for "a given date has opened for booking".
+    except (ValueError, IndexError):
+        raise ValueError(
+            f"Cannot construct format URL from: {cfg['target_url']}"
+        )
 
-    BMS only renders showtimes for the date currently being displayed, and it
-    silently falls back to the nearest available date when you request a date
-    that hasn't opened yet. So the requested date (e.g. 20260720) sits at a
-    low ~3 count (just the date-strip navigation) until it opens, at which
-    point its showtimes render and it becomes the *dominant* date token.
-
-    Rule: open when the requested date is the most-referenced date token on
-    the page and it clears a small floor (well above strip-only noise).
-    """
-    requested = cfg["requested_date"]  # e.g. "20260720"
-    floor = cfg.get("min_references", 10)
-
-    tokens = re.findall(r"20\d{6}", page_text)
-    if not tokens:
-        return False
-
-    counts = Counter(tokens)
-    top_date, _ = counts.most_common(1)[0]
-    requested_count = counts.get(requested, 0)
-
-    return top_date == requested and requested_count >= floor
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        "/".join(segments),
+        parts.query,
+        parts.fragment
+    ))
 
 
-def is_available_venue_date(page_text, cfg):
-    """
-    Theatre-specific detector: is a given venue bookable on a given date?
+# ============================================================
+# Extract all formats for the configured languages
+# ============================================================
 
-    BMS renders a per-venue booking link like
-        /cinemas/chennai/<slug>/buytickets/<venueCode>/<date>
-    only when that venue has live shows for that exact date. Because the date
-    is baked into the link, it can't be confused with the silent fallback
-    (a fallback page carries /<code>/<fallbackDate>, not /<code>/<ourDate>).
+def extract_formats(state, cfg):
+    selectors = find_format_selector(state)
 
-    Set venue_code (one) or venue_codes (list). With a list, it's open when
-    ANY of them is bookable for the date.
-    """
+    if not selectors:
+        print("WARNING: format-selector not found.")
+        return []
+
+    wanted_languages = [lang.lower() for lang in cfg["languages"]]
+
+    formats = []
+    seen = set()
+
+    for selector in selectors:
+
+        widgets = selector.get("widgets", [])
+
+        for widget in widgets:
+
+            if widget.get("type") != "chip-list":
+                continue
+
+            language = widget.get("text", "Unknown")
+
+            # Language filter (English only by default).
+            if language.lower() not in wanted_languages:
+                continue
+
+            for chip in widget.get("data", []):
+
+                title = chip.get("title")
+
+                cta = chip.get("cta", {})
+                additional = cta.get("additionalData", {})
+
+                event_code = additional.get("eventCode")
+                event_slug = additional.get("eventUrl")
+
+                if not title or not event_code or not event_slug:
+                    continue
+
+                # Ignore the all-formats option.
+                if event_code == "*":
+                    continue
+
+                # isDisabled is NOT used to skip formats: BookMyShow
+                # sets it on the format currently being viewed.
+
+                key = (event_code, language)
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                url = build_format_url(
+                    cfg,
+                    event_code,
+                    event_slug
+                )
+
+                formats.append({
+                    "title": title,
+                    "language": language,
+                    "code": event_code,
+                    "url": url
+                })
+
+    return formats
+
+
+# ============================================================
+# Venue detection (parses JSON, not page text)
+# ============================================================
+
+def venue_is_wanted(code, name, cfg):
+    """True if no venues configured, or code/name matches config."""
+    if not cfg["venue_codes"] and not cfg["venue_labels"]:
+        return True
+
+    if code in cfg["venue_codes"]:
+        return True
+
+    labels = {label.lower() for label in cfg["venue_labels"].values()}
+
+    return name.lower() in labels
+
+
+def check_venues(page, cfg):
+    state = extract_state(page)
+
     date = cfg["requested_date"]
-    codes = cfg.get("venue_codes") or [cfg["venue_code"]]
 
-    available = [
-        code for code in codes
-        if f"/{code}/{date}" in page_text
-    ]
+    found = {}
+    cards = 0
 
-    return available
+    for card in walk(state):
+
+        if card.get("type") != "venue-card":
+            continue
+
+        cards += 1
+
+        additional = card.get("additionalData", {})
+        code = additional.get("venueCode", "")
+        name = additional.get("venueName", code)
+
+        if not venue_is_wanted(code, name, cfg):
+            continue
+
+        print(f"  [venue] {code} | {name}")
+
+        shows = []
+
+        for section in card.get("showtimesSections", []):
+
+            for showtime in section.get("showtimes", []):
+
+                show_data = showtime.get("additionalData", {})
+                show_time = show_data.get("showTime", "?")
+
+                # BookMyShow silently falls back to another date
+                # when the requested one isn't open. Ignore those.
+                if show_data.get("showDateCode") != date:
+                    print(
+                        f"    [reject] {show_time}: date "
+                        f"{show_data.get('showDateCode')} != {date}"
+                    )
+                    continue
+
+                # availStatus "0" means sold out.
+                if show_data.get("availStatus") == "0":
+                    print(f"    [reject] {show_time}: sold out")
+                    continue
+
+                print(f"    [ok] {show_time}")
+
+                label = show_time
+
+                if show_data.get("attributes"):
+                    label += f" ({show_data['attributes']})"
+
+                shows.append(label)
+
+        if shows:
+            found[code] = {
+                "name": name,
+                "shows": shows
+            }
+
+    print(f"  venue cards on page: {cards}")
+
+    return found
 
 
-def is_available(page_text, cfg):
-    detector = cfg.get("detector")
-    if detector == "venue_date":
-        return is_available_venue_date(page_text, cfg)
-    if detector == "bms_date":
-        return is_available_bms_date(page_text, cfg)
-    return is_available_generic(page_text, cfg)
+# ============================================================
+# Telegram notification
+# ============================================================
 
+def send_telegram(cfg, message):
+    token = cfg.get("telegram_bot_token")
+    chat_id = cfg.get("telegram_chat_id")
 
-def is_available_generic(page_text, cfg):
-    """
-    Booking is considered OPEN for the target theatre when the theatre name
-    is present AND at least one 'booking is live' signal is present.
+    if not token or not chat_id:
+        raise ValueError(
+            "Telegram bot token or chat ID is missing"
+        )
 
-    Matching is case-insensitive and ignores extra whitespace so small
-    formatting differences don't cause misses.
-    """
-    haystack = re.sub(r"\s+", " ", page_text).lower()
-
-    theatre = re.sub(r"\s+", " ", cfg["theatre"]).lower().strip()
-    if theatre not in haystack:
-        return False
-
-    # If the movie name is configured, require it too (avoids false hits when
-    # the theatre is listed for other movies).
-    movie = cfg.get("movie")
-    if movie:
-        if re.sub(r"\s+", " ", movie).lower().strip() not in haystack:
-            return False
-
-    # Signals that booking is actually live rather than "coming soon".
-    open_signals = cfg.get(
-        "open_signals",
-        ["book tickets", "book now", '"showtimes"', "showtime", "select seats"],
+    telegram_url = (
+        f"https://api.telegram.org/bot{token}/sendMessage"
     )
-    # Signals that it's NOT yet open -- if present near-exclusively, treat as closed.
-    closed_signals = cfg.get("closed_signals", ["notify me", "coming soon"])
 
-    has_open = any(s.lower() in haystack for s in open_signals)
-    only_closed = any(s.lower() in haystack for s in closed_signals) and not has_open
+    response = requests.post(
+        telegram_url,
+        data={
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": True
+        },
+        timeout=30
+    )
 
-    return has_open and not only_closed
+    response.raise_for_status()
 
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error: {result}"
+        )
+
+    print("Telegram notification sent successfully")
+
+
+# ============================================================
+# Check every format (for one date)
+# ============================================================
+
+def check_formats(cfg, formats, first_page):
+    """Returns (results, all_ok). all_ok is False if any format failed."""
+    results = []
+    all_ok = True
+
+    for fmt in formats:
+
+        title = fmt["title"]
+        language = fmt["language"]
+        url = fmt["url"]
+
+        print("\n" + "=" * 50)
+        print(f"Checking: {language} - {title}")
+        print(f"Event code: {fmt['code']}")
+        print(f"URL: {url}")
+
+        try:
+            # Reuse the first page for the format already loaded.
+            if fmt["code"] in cfg["target_url"]:
+                print("Reusing already fetched page")
+                page = first_page
+            else:
+                page = fetch(cfg, url)
+
+            venues = check_venues(page, cfg)
+
+            if venues:
+
+                print("\nMatching venues:")
+
+                for code, venue in venues.items():
+                    print(
+                        f"FOUND: {code} - {venue['name']}: "
+                        f"{', '.join(venue['shows'])}"
+                    )
+
+                results.append({
+                    "title": title,
+                    "language": language,
+                    "code": fmt["code"],
+                    "url": url,
+                    "date": cfg["requested_date"],
+                    "venues": venues
+                })
+
+            else:
+                print("No open shows at configured venues.")
+
+        except Exception as exc:
+            all_ok = False
+
+            print(
+                f"ERROR checking {title}: {exc}",
+                file=sys.stderr
+            )
+
+    return results, all_ok
+
+
+# ============================================================
+# Process one date
+# ============================================================
+
+def process_date(cfg, date_code):
+    """Returns (results, all_ok)."""
+    dcfg = cfg_for_date(cfg, date_code)
+
+    print("\n" + "#" * 60)
+    print(f"DATE: {pretty_date(date_code)} ({date_code})")
+    print(f"URL: {dcfg['target_url']}")
+    print("#" * 60)
+
+    first_page = fetch(dcfg)
+
+    state = extract_state(first_page)
+
+    # Formats can differ per date, so discover them for each date.
+    formats = extract_formats(state, dcfg)
+
+    if not formats:
+        print("\nNo formats extracted for this date.")
+        return [], True
+
+    print(f"\nFound {len(formats)} format(s):")
+
+    for fmt in formats:
+        print(
+            f"  {fmt['language']} - {fmt['title']} "
+            f"({fmt['code']})"
+        )
+
+    return check_formats(dcfg, formats, first_page)
+
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
     cfg = load_config()
-    state = load_json(STATE_PATH, default={"available": False}) or {"available": False}
 
-    target_desc = cfg.get("theatre") or cfg.get("requested_date", "target")
-    label = f"{cfg.get('movie', 'movie')} @ {target_desc}"
+    print("=" * 60)
+    print(f"Movie: {cfg['movie']}")
+    print(f"Dates: {', '.join(pretty_date(d) for d in cfg['dates'])}")
+    print(f"Languages: {', '.join(cfg['languages'])}")
+    print(f"Venues: {cfg['venue_codes'] or 'any'}")
+    print("=" * 60)
 
-    try:
-        page = fetch(cfg)
-    except requests.RequestException as exc:
-        # Transient network/blocking errors shouldn't crash the workflow.
-        print(f"[{label}] fetch failed: {exc}")
-        return 0
+    prev = load_state()
+    current = {}
+    notify_failed = False
 
-    if cfg.get("detector") == "venue_date":
-        available = is_available_venue_date(page, cfg)
-    else:
-        available = is_available(page, cfg)
-        
-    print(f"[{label}] available={available} (was {state.get('available')})")
+    for date_code in cfg["dates"]:
 
-    if available and not state.get("available"):
-        if cfg.get("detector") in ("bms_date", "venue_date"):
-            rd = cfg["requested_date"]
-            pretty = f"{rd[6:8]}-{rd[4:6]}-{rd[0:4]}"
-            venue = cfg.get("venue_label") or cfg.get("venue_code") or ""
-            venue_line = f"Theatre: {venue}\n" if venue else ""
-            msg = (
-                f"🎬 Booking just OPENED!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"{venue_line}"
-                f"Date: {pretty}\n\n"
-                f"Book here: {cfg['target_url']}"
+        try:
+            results, ok = process_date(cfg, date_code)
+
+        except Exception as exc:
+            # One bad date shouldn't stop the others.
+            print(
+                f"ERROR processing {date_code}: {exc}",
+                file=sys.stderr
             )
-        else:
-            msg = (
-                f"🎬 Booking is OPEN!\n\n"
-                f"{cfg.get('movie', 'Movie')}\n"
-                f"Theatre: {cfg['theatre']}\n\n"
-                f"Book here: {cfg['target_url']}"
+            results, ok = [], False
+
+        # If anything failed for this date, keep its previous state so a
+        # temporary error isn't mistaken for "sold out" and re-alerted.
+        if not ok:
+            for key, value in prev.items():
+                if key.startswith(date_code + ":"):
+                    current[key] = value
+
+        for result in results:
+
+            new_venues = {}
+
+            for vcode, venue in result["venues"].items():
+                key = state_key(result["date"], result["code"], vcode)
+                current[key] = True
+
+                if key not in prev:
+                    new_venues[vcode] = venue
+
+            if not new_venues:
+                print(
+                    f"No new venues for {result['title']} "
+                    f"on {result['date']} (already alerted)."
+                )
+                continue
+
+            message = (
+                "🎟️ Booking OPEN on BookMyShow!\n\n"
+                f"Movie: {cfg['movie']}\n"
+                f"Date: {pretty_date(result['date'])}\n"
+                f"Language: {result['language']}\n"
+                f"Format: {result['title']}\n\n"
+                + "\n".join(
+                    f"📍 {venue['name']}\n"
+                    + "\n".join(
+                        f"   • {show}" for show in venue["shows"][:8]
+                    )
+                    for venue in new_venues.values()
+                )
+                + f"\n\n{result['url']}"
             )
-        send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], msg)
-        print(f"[{label}] notification sent")
 
-    # Persist current state so we don't re-alert every run.
-    if available != state.get("available"):
-        state["available"] = available
-        state["checked_at"] = int(time.time())
-        save_json(STATE_PATH, state)
+            try:
+                send_telegram(cfg, message)
+            except Exception as exc:
+                # Don't mark as alerted if the message didn't go out.
+                notify_failed = True
+                print(f"ERROR sending Telegram: {exc}", file=sys.stderr)
+                for vcode in new_venues:
+                    current.pop(
+                        state_key(result["date"], result["code"], vcode),
+                        None
+                    )
 
-    return 0
+    save_state(current)
 
+    if not current:
+        print("\nNo open shows at configured venues on any date/format.")
+
+    print("\nRun completed.")
+
+    return 1 if notify_failed else 0
+
+
+# ============================================================
+# Entry point
+# ============================================================
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+
+    try:
+        sys.exit(main())
+
+    except Exception as exc:
+
+        print(
+            f"ERROR: {exc}",
+            file=sys.stderr
+        )
+
+        sys.exit(1)
